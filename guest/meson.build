@@ -6,6 +6,9 @@ payload_ld = find_program('ld', required: get_option('guest_payloads'))
 if payload_ld.found()
   payload_sources = {
     'realmode_hello': 'payloads/realmode_hello.S',
+    'realmode_mmio': 'payloads/realmode_mmio.S',
+    'realmode_ud2': 'payloads/realmode_ud2.S',
+    'realmode_triple': 'payloads/realmode_triple.S',
     'longmode_hello': 'payloads/longmode_hello.S',
   }
 

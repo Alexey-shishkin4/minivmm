@@ -18,6 +18,30 @@ def test_realmode_hello(minivmm, payloads):
     assert result.stdout == "Hello from real mode\n"
 
 
+def test_realmode_mmio(minivmm, payloads):
+    """Accesses above RAM exit to the VMM; an unassigned read returns all ones."""
+    result = run_minivmm(minivmm, "--mem", "1M", "--payload", payloads / "realmode_mmio.bin")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "mmio read 0xff\n"
+    assert "unhandled mmio write 0x100000, len 1, value 0x42" in result.stderr
+    assert "unhandled mmio read 0x100000, len 1" in result.stderr
+
+
+def test_realmode_ud2(minivmm, payloads):
+    """#UD goes through the guest's own IVT: no exit, the handler prints."""
+    result = run_minivmm(minivmm, "--payload", payloads / "realmode_ud2.bin")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "#UD at ud2\n"
+
+
+def test_realmode_triple_fault(minivmm, payloads):
+    """An IDT with limit 0 turns int3 into a triple fault: KVM_EXIT_SHUTDOWN."""
+    result = run_minivmm(minivmm, "--payload", payloads / "realmode_triple.bin")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "triple fault" in result.stderr
+
+
 def test_missing_payload(minivmm, tmp_path):
     result = run_minivmm(minivmm, "--payload", tmp_path / "nope.bin")
     assert result.returncode == 1
