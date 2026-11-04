@@ -1,0 +1,4 @@
+option('fuzzing', type: 'boolean', value: false,
+  description: 'Build libFuzzer targets (requires clang). Without it fuzz targets are built with a standalone driver and replay the corpus as regression tests.')
+option('guest_payloads', type: 'feature', value: 'enabled',
+  description: 'Assemble flat-binary guest payloads in guest/payloads (needs GNU as/ld)')

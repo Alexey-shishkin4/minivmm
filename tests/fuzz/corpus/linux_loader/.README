@@ -1,0 +1,1 @@
+Corpus and crash regressions for fuzz_linux_loader. Inputs are replayed by `meson test --suite fuzz-regression`.

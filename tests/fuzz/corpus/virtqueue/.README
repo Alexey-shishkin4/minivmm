@@ -1,0 +1,1 @@
+Corpus and crash regressions for fuzz_virtqueue. Inputs are replayed by `meson test --suite fuzz-regression`.

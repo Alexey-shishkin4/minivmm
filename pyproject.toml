@@ -1,0 +1,31 @@
+[project]
+name = "minivmm-tools"
+version = "0.1.0"
+description = "Integration tests and analysis tools for minivmm"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-timeout>=2.4",
+    "ruff>=0.13",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests/integration"]
+timeout = 60
+markers = [
+    "kvm: needs /dev/kvm",
+    "guest: needs guest/out artifacts (scripts/build-guest-kernel.sh, build-initramfs.sh)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
