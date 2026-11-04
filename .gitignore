@@ -1,0 +1,33 @@
+# Meson build directories
+/build/
+/build-*/
+compile_commands.json
+
+# Guest kernel / busybox sources, build trees and images
+/guest/out/
+
+# Fuzzing artefacts (minimized crashers go to tests/fuzz/corpus/<target>/ instead)
+/fuzz-work/
+crash-*
+leak-*
+timeout-*
+oom-*
+fuzz-*.log
+
+# Disk images and traces
+*.img
+*.qcow2
+perf.data*
+*.trace
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Editors
+.vscode/
+.idea/
+.cache/
