@@ -8,10 +8,10 @@
 
 #include "util/log.h"
 
-
 #define VMM_TSS_ADDR 0xFFFBD000UL
 
-static int create_vm(int kvm_fd) {
+static int create_vm(int kvm_fd)
+{
     int fd;
 
     do {
@@ -61,7 +61,6 @@ fail:
     errno = saved_errno;
     return -1;
 }
-
 
 void vmm_destroy(struct vmm *vm)
 {

@@ -1,15 +1,176 @@
 /*
  * minivmm command line entry point.
  *
- * TODO: options (getopt_long):
- *        --payload FILE   flat binary for stages 1-2 (real/long mode tests)
- *        --kernel FILE    bzImage, --initrd FILE, --cmdline STR
- *        --mem SIZE, --cpus N, --disk FILE[,ro], --stats (exit counters)
- * TODO: build struct vmm from options, run, map guest outcome to exit code
- *        (poweroff -> 0, triple fault / internal error -> non-zero)
+ * TODO: --kernel FILE, --initrd FILE, --cmdline STR (stage 3)
+ * TODO: --cpus N, --disk FILE[,ro], --stats (exit counters)
+ * TODO: map guest poweroff to exit code 0 once there is a way to power off
  */
 
-int main(void)
+#include <ctype.h>
+#include <errno.h>
+#include <getopt.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "boot/raw_loader.h"
+#include "util/log.h"
+#include "vcpu.h"
+#include "vmm.h"
+#include "x86/cpu_setup.h"
+
+#define EXIT_USAGE 2
+
+#define DEFAULT_RAM_SIZE 0x8000000ULL /* 128 MiB */
+
+struct options {
+    const char *payload;
+    struct vmm_config vm;
+};
+
+static void usage(FILE *out, const char *prog)
 {
+    fprintf(out,
+            "usage: %s --payload FILE [--mem SIZE] [--verbose]\n"
+            "\n"
+            "  -p, --payload FILE  flat binary run in real mode at 0x%x\n"
+            "  -m, --mem SIZE      guest RAM, suffix K, M or G (default 128M)\n"
+            "  -v, --verbose       debug logging\n"
+            "  -h, --help          show this help\n",
+            prog, RAW_LOAD_ADDR);
+}
+
+/* "64M" -> 0x4000000. Decimal only, so "010" is not octal 8. */
+static int parse_size(const char *s, uint64_t *out)
+{
+    unsigned long long value;
+    unsigned shift = 0;
+    char *end;
+
+    /* strtoull() accepts "-1" and returns ULLONG_MAX without an error. */
+    if (!isdigit((unsigned char)s[0])) {
+        return -1;
+    }
+    errno = 0;
+    value = strtoull(s, &end, 10);
+    if (errno != 0) {
+        return -1;
+    }
+    switch (*end) {
+    case 'K':
+    case 'k':
+        shift = 10;
+        end++;
+        break;
+    case 'M':
+    case 'm':
+        shift = 20;
+        end++;
+        break;
+    case 'G':
+    case 'g':
+        shift = 30;
+        end++;
+        break;
+    default:
+        break;
+    }
+    if (*end != '\0' || value > (UINT64_MAX >> shift)) {
+        return -1;
+    }
+    *out = (uint64_t)value << shift;
     return 0;
+}
+
+/* Returns 0 to run, 1 if --help was printed, -1 on a usage error. */
+static int parse_options(int argc, char **argv, struct options *opts)
+{
+    static const struct option long_options[] = {
+        {"payload", required_argument, NULL, 'p'},
+        {"mem", required_argument, NULL, 'm'},
+        {"verbose", no_argument, NULL, 'v'},
+        {"help", no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0},
+    };
+    int c;
+
+    opts->payload = NULL;
+    opts->vm.ram_size = DEFAULT_RAM_SIZE;
+
+    /* getopt keeps its state in globals: fine before any vCPU thread runs. */
+    /* NOLINTNEXTLINE(concurrency-mt-unsafe) */
+    while ((c = getopt_long(argc, argv, "p:m:vh", long_options, NULL)) != -1) {
+        switch (c) {
+        case 'p':
+            opts->payload = optarg;
+            break;
+        case 'm':
+            if (parse_size(optarg, &opts->vm.ram_size) < 0) {
+                log_error("--mem: bad size '%s'", optarg);
+                return -1;
+            }
+            break;
+        case 'v':
+            log_set_level(LOG_LEVEL_DEBUG);
+            break;
+        case 'h':
+            usage(stdout, argv[0]);
+            return 1;
+        default: /* getopt_long() has already printed what is wrong */
+            usage(stderr, argv[0]);
+            return -1;
+        }
+    }
+    if (optind < argc) {
+        log_error("unexpected argument '%s'", argv[optind]);
+        return -1;
+    }
+    if (opts->payload == NULL) {
+        log_error("--payload is required");
+        usage(stderr, argv[0]);
+        return -1;
+    }
+    return 0;
+}
+
+/* Create the VM, run the payload and tear everything down again. */
+static int run_payload(const struct options *opts)
+{
+    struct vmm vm;
+    struct vcpu vcpu;
+    int ret = EXIT_FAILURE;
+
+    if (vmm_create(&vm, &opts->vm) < 0) {
+        return EXIT_FAILURE;
+    }
+    if (raw_load(&vm.mem, opts->payload) < 0) {
+        goto out_vm;
+    }
+    /* TODO: struct vmm owns its vCPUs once there is more than one */
+    if (vcpu_create(&vcpu, &vm, 0) < 0) {
+        goto out_vm;
+    }
+    if (cpu_setup_real_mode(&vcpu, RAW_LOAD_ADDR) < 0) {
+        goto out_vcpu;
+    }
+    if (vcpu_run(&vcpu) == VCPU_STOP_HLT) {
+        ret = EXIT_SUCCESS;
+    }
+
+out_vcpu:
+    vcpu_destroy(&vcpu);
+out_vm:
+    vmm_destroy(&vm);
+    return ret;
+}
+
+int main(int argc, char **argv)
+{
+    struct options opts;
+    const int parsed = parse_options(argc, argv, &opts);
+
+    if (parsed != 0) {
+        return parsed > 0 ? EXIT_SUCCESS : EXIT_USAGE;
+    }
+    return run_payload(&opts);
 }
