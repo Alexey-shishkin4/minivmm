@@ -1,11 +1,15 @@
 #include "x86/cpu_setup.h"
 
 #include <asm/kvm.h>
+#include <errno.h>
 #include <linux/kvm.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
 
+#include "boot/raw_loader.h"
+#include "memory.h"
 #include "util/log.h"
 #include "vcpu.h"
 
@@ -17,6 +21,36 @@
 /* Descriptor types (s = 1): bit 3 code, bit 1 read/write, bit 0 accessed */
 #define SEG_TYPE_DATA_RW 0x3
 #define SEG_TYPE_CODE_RX 0xb
+
+#define LM_BOOT_GPA 0x10000ULL
+
+#define LM_PAGE_FLAGS 0x3ULL
+#define LM_LARGE_PAGE 0x80ULL
+
+#define LM_CR0 0x80010033ULL //PG | WP |NE |ET |MP |PE
+#define LM_CR4_PAE 0x20ULL
+#define LM_EFER 0x500ULL
+
+/*
+ * The structure is placed at LM_BOOT_GPA in guest RAM.
+ * Each table begins at a 4 KiB boundary.
+ *
+ * [0x10000, 0x11000): PML4
+ * [0x11000, 0x12000): PDPT
+ * [0x12000, 0x13000): PD
+ * [0x13000, 0x14000): GDT storage
+ * [0x14000, 0x18000): stack
+ */
+struct long_mode_boot {
+    uint64_t pml4[512];
+    uint64_t pdpt[512];
+    uint64_t pd[512];
+    uint64_t gdt[512];
+    uint8_t stack[0x4000];
+};
+
+_Static_assert(RAW_LOAD_ADDR + RAW_MAX_SIZE <= LM_BOOT_GPA,
+               "payload overlaps long-mode boot data");
 
 /*
  * A real mode segment as the CPU keeps it after loading a selector: the
@@ -64,5 +98,120 @@ int cpu_setup_real_mode(const struct vcpu *vcpu, uint16_t ip)
         log_errno("KVM_SET_REGS");
         return -1;
     }
+    return 0;
+}
+
+int cpu_setup_long_mode(const struct vcpu *vcpu, const struct guest_memory *mem)
+{
+    struct long_mode_boot *boot;
+    struct kvm_sregs sregs;
+    struct kvm_regs regs = {0};
+
+    boot = gpa_to_hva(mem, LM_BOOT_GPA, sizeof(*boot));
+    if (boot == NULL) {
+        errno = ENOMEM;
+        log_error("long-mode boot data does not fit in guest RAM");
+        return -1;
+    }
+
+    /*
+     * Preserve reset-state fields that this setup does not change,
+     * including TR, LDTR and APIC base.
+     */
+    if (ioctl(vcpu->fd, KVM_GET_SREGS, &sregs) < 0) {
+        log_errno("KVM_GET_SREGS");
+        return -1;
+    }
+
+    memset(boot, 0, sizeof(*boot));
+
+    /*
+     * Table entries contain guest physical addresses, not host pointers.
+     * Only entry 0 is needed at the PML4 and PDPT levels.
+     */
+    boot->pml4[0] =
+        (LM_BOOT_GPA + offsetof(struct long_mode_boot, pdpt)) | LM_PAGE_FLAGS;
+
+    boot->pdpt[0] =
+        (LM_BOOT_GPA + offsetof(struct long_mode_boot, pd)) | LM_PAGE_FLAGS;
+
+    /* Identity-map [0, 1 GiB) with 512 pages of 2 MiB each. */
+    for (unsigned i = 0; i < 512; i++) {
+        boot->pd[i] = ((uint64_t)i << 21U) | LM_PAGE_FLAGS | LM_LARGE_PAGE;
+    }
+
+    /*
+     * GDT entries:
+     *   0: null
+     *   1: executable/readable code, L=1, D=0, DPL=0
+     *   2: writable data, D/B=1, DPL=0
+     * Accessed bits are already set.
+     */
+    boot->gdt[1] = 0x00af9b000000ffffULL;
+    boot->gdt[2] = 0x00cf93000000ffffULL;
+
+    sregs.gdt.base = LM_BOOT_GPA + offsetof(struct long_mode_boot, gdt);
+    sregs.gdt.limit = 3 * sizeof(uint64_t) - 1;
+
+    /*
+     * KVM takes the cached segment state directly.
+     * Writing descriptors into guest RAM alone would not initialize CS.
+     */
+    sregs.cs = (struct kvm_segment){
+        .base = 0,
+        .limit = 0xffffffffU,
+        .selector = 0x08,
+        .type = SEG_TYPE_CODE_RX,
+        .present = 1,
+        .s = 1,
+        .l = 1,
+        .g = 1,
+    };
+
+    sregs.ds = (struct kvm_segment){
+        .base = 0,
+        .limit = 0xffffffffU,
+        .selector = 0x10,
+        .type = SEG_TYPE_DATA_RW,
+        .present = 1,
+        .s = 1,
+        .db = 1,
+        .g = 1,
+    };
+
+    sregs.es = sregs.ds;
+    sregs.fs = sregs.ds;
+    sregs.gs = sregs.ds;
+    sregs.ss = sregs.ds;
+
+    /* No exception handlers yet: a fault will normally cause shutdown. */
+    sregs.idt.base = 0;
+    sregs.idt.limit = 0;
+
+    sregs.cr0 = LM_CR0;
+    sregs.cr2 = 0;
+    sregs.cr3 = LM_BOOT_GPA;
+    sregs.cr4 = LM_CR4_PAE;
+    sregs.cr8 = 0;
+    sregs.efer = LM_EFER;
+
+    if (ioctl(vcpu->fd, KVM_SET_SREGS, &sregs) < 0) {
+        log_errno("KVM_SET_SREGS (long mode)");
+        return -1;
+    }
+
+    regs.rip = RAW_LOAD_ADDR;
+
+    /* The first push writes below this address, inside the stack. */
+    regs.rsp = LM_BOOT_GPA + sizeof(*boot);
+
+    /* Reserved bit 1 is set; interrupts and direction flag are clear. */
+    regs.rflags = X86_RFLAGS_FIXED;
+
+    if (ioctl(vcpu->fd, KVM_SET_REGS, &regs) < 0) {
+        log_errno("KVM_SET_REGS (long mode)");
+        return -1;
+    }
+
     return 0;
 }

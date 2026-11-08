@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 
+struct guest_memory;
 struct vcpu;
 
 /*
@@ -21,5 +22,8 @@ struct vcpu;
  * Returns -1 with errno set on failure.
  */
 int cpu_setup_real_mode(const struct vcpu *vcpu, uint16_t ip);
+
+int cpu_setup_long_mode(const struct vcpu *vcpu,
+                        const struct guest_memory *mem);
 
 #endif /* MINIVMM_X86_CPU_SETUP_H */

@@ -9,15 +9,18 @@
 #include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "boot/raw_loader.h"
 #include "util/log.h"
 #include "vcpu.h"
 #include "vmm.h"
 #include "x86/cpu_setup.h"
+#include "x86/cpuid.h"
 
 #define EXIT_USAGE 2
 
@@ -26,18 +29,21 @@
 struct options {
     const char *payload;
     struct vmm_config vm;
+    bool long_mode;
 };
 
 static void usage(FILE *out, const char *prog)
 {
-    fprintf(out,
-            "usage: %s --payload FILE [--mem SIZE] [--verbose]\n"
-            "\n"
-            "  -p, --payload FILE  flat binary run in real mode at 0x%x\n"
-            "  -m, --mem SIZE      guest RAM, suffix K, M or G (default 128M)\n"
-            "  -v, --verbose       debug logging\n"
-            "  -h, --help          show this help\n",
-            prog, RAW_LOAD_ADDR);
+    fprintf(
+        out,
+        "usage: %s --payload FILE [--mem SIZE] [--mode real|long] [--verbose]\n"
+        "\n"
+        "  -p, --payload FILE  flat binary loaded at 0x%x\n"
+        "  -m, --mem SIZE      guest RAM, suffix K, M or G (default 128M)\n"
+        "      --mode MODE     real (default) or long\n"
+        "  -v, --verbose       debug logging\n"
+        "  -h, --help          show this help\n",
+        prog, RAW_LOAD_ADDR);
 }
 
 /* "64M" -> 0x4000000. Decimal only, so "010" is not octal 8. */
@@ -85,7 +91,10 @@ static int parse_size(const char *s, uint64_t *out)
 /* Returns 0 to run, 1 if --help was printed, -1 on a usage error. */
 static int parse_options(int argc, char **argv, struct options *opts)
 {
+    enum { OPT_MODE = 256 };
+
     static const struct option long_options[] = {
+        {"mode", required_argument, NULL, OPT_MODE},
         {"payload", required_argument, NULL, 'p'},
         {"mem", required_argument, NULL, 'm'},
         {"verbose", no_argument, NULL, 'v'},
@@ -95,6 +104,7 @@ static int parse_options(int argc, char **argv, struct options *opts)
     int c;
 
     opts->payload = NULL;
+    opts->long_mode = false;
     opts->vm.ram_size = DEFAULT_RAM_SIZE;
 
     /* getopt keeps its state in globals: fine before any vCPU thread runs. */
@@ -107,6 +117,16 @@ static int parse_options(int argc, char **argv, struct options *opts)
         case 'm':
             if (parse_size(optarg, &opts->vm.ram_size) < 0) {
                 log_error("--mem: bad size '%s'", optarg);
+                return -1;
+            }
+            break;
+        case OPT_MODE:
+            if (strcmp(optarg, "real") == 0) {
+                opts->long_mode = false;
+            } else if (strcmp(optarg, "long") == 0) {
+                opts->long_mode = true;
+            } else {
+                log_error("--mode: expected real or long, got '%s'", optarg);
                 return -1;
             }
             break;
@@ -143,6 +163,7 @@ static int run_payload(const struct options *opts)
     if (vmm_create(&vm, &opts->vm) < 0) {
         return EXIT_FAILURE;
     }
+
     if (raw_load(&vm.mem, opts->payload) < 0) {
         goto out_vm;
     }
@@ -150,7 +171,12 @@ static int run_payload(const struct options *opts)
     if (vcpu_create(&vcpu, &vm, 0) < 0) {
         goto out_vm;
     }
-    if (cpu_setup_real_mode(&vcpu, RAW_LOAD_ADDR) < 0) {
+    if (opts->long_mode) {
+        if (cpuid_setup(&vm.kvm, &vcpu) < 0 ||
+            cpu_setup_long_mode(&vcpu, &vm.mem) < 0) {
+            goto out_vcpu;
+        }
+    } else if (cpu_setup_real_mode(&vcpu, RAW_LOAD_ADDR) < 0) {
         goto out_vcpu;
     }
     if (vcpu_run(&vcpu) == VCPU_STOP_HLT) {

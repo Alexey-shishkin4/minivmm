@@ -10,6 +10,9 @@
 #ifndef MINIVMM_X86_CPUID_H
 #define MINIVMM_X86_CPUID_H
 
+struct kvm_system;
 struct vcpu;
+
+int cpuid_setup(const struct kvm_system *kvm, const struct vcpu *vcpu);
 
 #endif /* MINIVMM_X86_CPUID_H */

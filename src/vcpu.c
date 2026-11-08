@@ -52,9 +52,11 @@ int vcpu_create(struct vcpu *vcpu, const struct vmm *vm, unsigned id)
     int saved_errno;
     void *run;
 
-    vcpu->id = id;
-    vcpu->run = NULL;
-    vcpu->run_size = vm->kvm.vcpu_mmap_size;
+    *vcpu = (struct vcpu){
+        .fd = -1,
+        .id = id,
+        .run_size = vm->kvm.vcpu_mmap_size,
+    };
 
     vcpu->fd = ioctl(vm->vm_fd, KVM_CREATE_VCPU, (unsigned long)id);
     if (vcpu->fd < 0) {
@@ -177,6 +179,82 @@ static bool handle_exit(struct kvm_run *run, enum vcpu_stop *stop)
     }
 }
 
+static void dump_segment(const char *name, const struct kvm_segment *s)
+{
+    log_error("%s: sel=%04x base=%016llx limit=%08x "
+              "type=%x p=%u s=%u dpl=%u l=%u db=%u g=%u unusable=%u",
+              name, (unsigned)s->selector, (unsigned long long)s->base,
+              (unsigned)s->limit, (unsigned)s->type, (unsigned)s->present,
+              (unsigned)s->s, (unsigned)s->dpl, (unsigned)s->l, (unsigned)s->db,
+              (unsigned)s->g, (unsigned)s->unusable);
+}
+
+#define DUMP_REG(regs, name)                                                   \
+    log_error(#name "=%016llx", (unsigned long long)(regs).name)
+
+static void vcpu_dump_regs(const struct vcpu *vcpu)
+{
+    const int saved = errno;
+    struct kvm_regs r;
+    struct kvm_sregs s;
+
+    if (ioctl(vcpu->fd, KVM_GET_REGS, &r) < 0) {
+        log_errno("KVM_GET_REGS (dump)");
+    } else {
+        DUMP_REG(r, rip);
+        DUMP_REG(r, rsp);
+        DUMP_REG(r, rbp);
+        DUMP_REG(r, rflags);
+        DUMP_REG(r, rax);
+        DUMP_REG(r, rbx);
+        DUMP_REG(r, rcx);
+        DUMP_REG(r, rdx);
+        DUMP_REG(r, rsi);
+        DUMP_REG(r, rdi);
+        DUMP_REG(r, r8);
+        DUMP_REG(r, r9);
+        DUMP_REG(r, r10);
+        DUMP_REG(r, r11);
+        DUMP_REG(r, r12);
+        DUMP_REG(r, r13);
+        DUMP_REG(r, r14);
+        DUMP_REG(r, r15);
+    }
+
+    /*
+     * Attempt this even if KVM_GET_REGS failed: special registers may
+     * still be available.
+     */
+    if (ioctl(vcpu->fd, KVM_GET_SREGS, &s) < 0) {
+        log_errno("KVM_GET_SREGS (dump)");
+    } else {
+        DUMP_REG(s, cr0);
+        DUMP_REG(s, cr2);
+        DUMP_REG(s, cr3);
+        DUMP_REG(s, cr4);
+        DUMP_REG(s, cr8);
+        DUMP_REG(s, efer);
+
+        dump_segment("cs", &s.cs);
+        dump_segment("ss", &s.ss);
+        dump_segment("ds", &s.ds);
+        dump_segment("es", &s.es);
+        dump_segment("fs", &s.fs);
+        dump_segment("gs", &s.gs);
+        dump_segment("tr", &s.tr);
+        dump_segment("ldt", &s.ldt);
+
+        log_error("gdt: base=%016llx limit=%04x",
+                  (unsigned long long)s.gdt.base, (unsigned)s.gdt.limit);
+        log_error("idt: base=%016llx limit=%04x",
+                  (unsigned long long)s.idt.base, (unsigned)s.idt.limit);
+    }
+
+    errno = saved;
+}
+
+#undef DUMP_REG
+
 enum vcpu_stop vcpu_run(struct vcpu *vcpu)
 {
     enum vcpu_stop stop;
@@ -195,6 +273,10 @@ enum vcpu_stop vcpu_run(struct vcpu *vcpu)
         if (!handle_exit(vcpu->run, &stop)) {
             break;
         }
+    }
+
+    if (stop != VCPU_STOP_HLT) {
+        vcpu_dump_regs(vcpu);
     }
     log_set_vcpu(-1);
     return stop;

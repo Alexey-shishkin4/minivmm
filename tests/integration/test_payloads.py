@@ -48,6 +48,14 @@ def test_missing_payload(minivmm, tmp_path):
     assert "No such file or directory" in result.stderr
 
 
-@pytest.mark.skip(reason="TODO: stage 2")
 def test_longmode_hello(minivmm, payloads):
-    """TODO: same in 64-bit mode; also check reported CPUID / MMIO exit handling."""
+    """The 64-bit guest checks arithmetic, CPUID and MMIO, then halts."""
+    result = run_minivmm(
+        minivmm, "--mode", "long", "--mem", "1M", "--payload", payloads / "longmode_hello.bin"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == (
+        "Hello from long mode\n64-bit arithmetic: OK\nCPUID: OK\nMMIO: OK\nlongmode: PASS\n"
+    )
+    assert "unhandled mmio write 0x200000, len 1, value 0x42" in result.stderr
+    assert "unhandled mmio read 0x200000, len 1" in result.stderr
