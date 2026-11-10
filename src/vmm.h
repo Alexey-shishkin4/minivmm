@@ -2,27 +2,36 @@
  * Top-level VM object: owns KVM fds, guest memory, vCPUs and device buses.
  *
  * TODO: vcpu array and vmm_run() (with vcpu.c)
- * TODO: pio/mmio buses, PCI root, event loop
- * TODO: KVM_CREATE_IRQCHIP, KVM_CREATE_PIT2 (stage 4)
+ * TODO: PCI root, event loop
  * TODO: orderly shutdown: guest reboot/poweroff, SIGINT, vCPU errors
  */
 
 #ifndef MINIVMM_VMM_H
 #define MINIVMM_VMM_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
+#include "devices/bus.h"
+#include "devices/i8042.h"
+#include "devices/serial8250.h"
 #include "kvm.h"
 #include "memory.h"
 
 struct vmm_config {
     uint64_t ram_size; /* bytes, page-aligned */
+    bool linux_boot;   /* in-kernel PIC/IOAPIC/LAPIC and PIT for Linux */
 };
 
 struct vmm {
     struct kvm_system kvm;
     int vm_fd;
     struct guest_memory mem;
+    struct bus pio_bus;
+    struct bus mmio_bus;
+    struct serial8250 serial;
+    struct i8042 i8042;
+    bool has_irqchip;
 };
 
 /*

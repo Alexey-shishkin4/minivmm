@@ -3,11 +3,14 @@
 #include <asm/kvm.h>
 #include <errno.h>
 #include <linux/kvm.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
 
+#include "boot/layout.h"
+#include "boot/linux_loader.h"
 #include "boot/raw_loader.h"
 #include "memory.h"
 #include "util/log.h"
@@ -22,7 +25,7 @@
 #define SEG_TYPE_DATA_RW 0x3
 #define SEG_TYPE_CODE_RX 0xb
 
-#define LM_BOOT_GPA 0x10000ULL
+#define LM_BOOT_GPA BOOT_TABLES_GPA
 
 #define LM_PAGE_FLAGS 0x3ULL
 #define LM_LARGE_PAGE 0x80ULL
@@ -51,6 +54,8 @@ struct long_mode_boot {
 
 _Static_assert(RAW_LOAD_ADDR + RAW_MAX_SIZE <= LM_BOOT_GPA,
                "payload overlaps long-mode boot data");
+_Static_assert(LM_BOOT_GPA + sizeof(struct long_mode_boot) <= BOOT_PARAMS_GPA,
+               "page tables and bootstrap stack overlap Linux zero page");
 
 /*
  * A real mode segment as the CPU keeps it after loading a selector: the
@@ -101,7 +106,9 @@ int cpu_setup_real_mode(const struct vcpu *vcpu, uint16_t ip)
     return 0;
 }
 
-int cpu_setup_long_mode(const struct vcpu *vcpu, const struct guest_memory *mem)
+static int setup_long_mode(const struct vcpu *vcpu,
+                           const struct guest_memory *mem, uint64_t entry,
+                           uint64_t params, bool linux_guest)
 {
     struct long_mode_boot *boot;
     struct kvm_sregs sregs;
@@ -141,17 +148,19 @@ int cpu_setup_long_mode(const struct vcpu *vcpu, const struct guest_memory *mem)
     }
 
     /*
-     * GDT entries:
+     * GDT entries (raw payload / Linux boot ABI):
      *   0: null
-     *   1: executable/readable code, L=1, D=0, DPL=0
-     *   2: writable data, D/B=1, DPL=0
+     *   1 / 2: executable/readable code, L=1, D=0, DPL=0
+     *   2 / 3: writable data, D/B=1, DPL=0
      * Accessed bits are already set.
      */
-    boot->gdt[1] = 0x00af9b000000ffffULL;
-    boot->gdt[2] = 0x00cf93000000ffffULL;
+    const unsigned code_index = linux_guest ? 2U : 1U;
+    const unsigned data_index = code_index + 1U;
+    boot->gdt[code_index] = 0x00af9b000000ffffULL;
+    boot->gdt[data_index] = 0x00cf93000000ffffULL;
 
     sregs.gdt.base = LM_BOOT_GPA + offsetof(struct long_mode_boot, gdt);
-    sregs.gdt.limit = 3 * sizeof(uint64_t) - 1;
+    sregs.gdt.limit = (uint16_t)(((data_index + 1U) * sizeof(uint64_t)) - 1U);
 
     /*
      * KVM takes the cached segment state directly.
@@ -160,7 +169,7 @@ int cpu_setup_long_mode(const struct vcpu *vcpu, const struct guest_memory *mem)
     sregs.cs = (struct kvm_segment){
         .base = 0,
         .limit = 0xffffffffU,
-        .selector = 0x08,
+        .selector = (uint16_t)(code_index * 8U),
         .type = SEG_TYPE_CODE_RX,
         .present = 1,
         .s = 1,
@@ -171,7 +180,7 @@ int cpu_setup_long_mode(const struct vcpu *vcpu, const struct guest_memory *mem)
     sregs.ds = (struct kvm_segment){
         .base = 0,
         .limit = 0xffffffffU,
-        .selector = 0x10,
+        .selector = (uint16_t)(data_index * 8U),
         .type = SEG_TYPE_DATA_RW,
         .present = 1,
         .s = 1,
@@ -200,7 +209,8 @@ int cpu_setup_long_mode(const struct vcpu *vcpu, const struct guest_memory *mem)
         return -1;
     }
 
-    regs.rip = RAW_LOAD_ADDR;
+    regs.rip = entry;
+    regs.rsi = params;
 
     /* The first push writes below this address, inside the stack. */
     regs.rsp = LM_BOOT_GPA + sizeof(*boot);
@@ -214,4 +224,20 @@ int cpu_setup_long_mode(const struct vcpu *vcpu, const struct guest_memory *mem)
     }
 
     return 0;
+}
+
+int cpu_setup_long_mode(const struct vcpu *vcpu, const struct guest_memory *mem)
+{
+    return setup_long_mode(vcpu, mem, RAW_LOAD_ADDR, 0, false);
+}
+
+int cpu_setup_linux(const struct vcpu *vcpu, const struct guest_memory *mem,
+                    const struct linux_boot *boot)
+{
+    if (boot == NULL || boot->entry >= BOOT_IDENTITY_LIMIT ||
+        boot->params_addr >= BOOT_IDENTITY_LIMIT) {
+        errno = EINVAL;
+        return -1;
+    }
+    return setup_long_mode(vcpu, mem, boot->entry, boot->params_addr, true);
 }

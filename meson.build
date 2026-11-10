@@ -42,6 +42,15 @@ endif
 
 threads = dependency('threads')
 
+if get_option('fuzzing')
+  if cc.get_id() != 'clang'
+    error('-Dfuzzing=true requires clang (CC=clang meson setup ...)')
+  endif
+  # Instrument the parser in the core library, not just the fuzz entry point.
+  add_project_arguments('-fsanitize=fuzzer-no-link', language: 'c')
+  add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
+endif
+
 inc = include_directories('src')
 
 subdir('src')

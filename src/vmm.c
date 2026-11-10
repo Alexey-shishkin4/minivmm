@@ -9,6 +9,43 @@
 #include "util/log.h"
 
 #define VMM_TSS_ADDR 0xFFFBD000UL
+#define COM1_BASE 0x3f8
+
+static int serial_irq(void *opaque, bool level)
+{
+    const struct vmm *vm = opaque;
+    const struct kvm_irq_level irq = {.irq = 4, .level = level ? 1U : 0U};
+
+    return ioctl(vm->vm_fd, KVM_IRQ_LINE, &irq);
+}
+
+static int setup_linux_platform(struct vmm *vm)
+{
+    const struct kvm_pit_config pit = {0};
+
+    if (kvm_check_extension(vm->kvm.fd, KVM_CAP_IRQCHIP) <= 0 ||
+        kvm_check_extension(vm->kvm.fd, KVM_CAP_PIT2) <= 0) {
+        errno = ENOTSUP;
+        log_error("Linux boot requires KVM_CAP_IRQCHIP and KVM_CAP_PIT2");
+        return -1;
+    }
+    if (ioctl(vm->vm_fd, KVM_CREATE_IRQCHIP, 0UL) < 0) {
+        log_errno("KVM_CREATE_IRQCHIP");
+        return -1;
+    }
+    if (ioctl(vm->vm_fd, KVM_CREATE_PIT2, &pit) < 0) {
+        log_errno("KVM_CREATE_PIT2");
+        return -1;
+    }
+    vm->has_irqchip = true;
+    if (serial8250_set_irq(&vm->serial, serial_irq, vm) < 0 ||
+        bus_register(&vm->pio_bus, I8042_COMMAND_PORT, 1, i8042_access,
+                     &vm->i8042) < 0) {
+        log_errno("register Linux platform devices");
+        return -1;
+    }
+    return 0;
+}
 
 static int create_vm(int kvm_fd)
 {
@@ -24,8 +61,16 @@ int vmm_create(struct vmm *vm, const struct vmm_config *cfg)
 {
     int saved_errno;
 
-    vm->vm_fd = -1;
-    vm->mem.nr_regions = 0;
+    *vm = (struct vmm){.kvm = {.fd = -1}, .vm_fd = -1};
+    bus_init(&vm->pio_bus, UINT16_MAX);
+    bus_init(&vm->mmio_bus, UINT64_MAX);
+    serial8250_init(&vm->serial, STDOUT_FILENO);
+
+    if (bus_register(&vm->pio_bus, COM1_BASE, SERIAL8250_REG_COUNT,
+                     serial8250_access, &vm->serial) < 0) {
+        log_errno("register COM1 UART");
+        return -1;
+    }
 
     if (kvm_open(&vm->kvm) < 0) {
         return -1;
@@ -39,6 +84,11 @@ int vmm_create(struct vmm *vm, const struct vmm_config *cfg)
 
     if (ioctl(vm->vm_fd, KVM_SET_TSS_ADDR, VMM_TSS_ADDR) < 0) {
         log_errno("KVM_SET_TSS_ADDR");
+        goto fail;
+    }
+
+    /* The in-kernel irqchip must exist before creating the first vCPU. */
+    if (cfg->linux_boot && setup_linux_platform(vm) < 0) {
         goto fail;
     }
 

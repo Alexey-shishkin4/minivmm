@@ -27,7 +27,8 @@ if [[ ! -f "${BBBUILD}/.config" ]]; then
         "${BBBUILD}/.config"
     make -C "${BBSRC}" O="${BBBUILD}" oldconfig </dev/null >/dev/null
 fi
-make -C "${BBBUILD}" -j"$(nproc)" busybox
+# Regenerate the output wrapper when the checkout was moved to another path.
+make -C "${BBSRC}" O="${BBBUILD}" -j"$(nproc)" busybox
 
 # --- /init --------------------------------------------------------------------
 rm -rf "${ROOTFS}"

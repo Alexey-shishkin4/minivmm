@@ -5,8 +5,9 @@ the KVM API: from a 16-bit "hello" payload to booting a real Linux kernel with
 virtio devices, SMP and ACPI. Built to understand, measure and harden every
 layer between `ioctl(KVM_RUN)` and a guest driver.
 
-> Status: skeleton. Build, tests, fuzzing harness and CI are in place; the VMM
-> is implemented stage by stage, see [docs/ROADMAP.md](docs/ROADMAP.md).
+> Status: real/long-mode payloads and Linux boot to the test PID 1 work.
+> Linux prints `minivmm-init: ready` and reboots through i8042; interactive
+> input, PCI and virtio are planned in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Architecture
 
@@ -65,6 +66,21 @@ scripts/build-initramfs.sh
 scripts/run-qemu-reference.sh   # same guest under QEMU, for comparison
 ```
 
+Boot Linux with minivmm (inside the development VM, use
+`build/vm-debug/src/minivmm`):
+
+```bash
+build/debug/src/minivmm --kernel guest/out/bzImage \
+    --initrd guest/out/initramfs.cpio.gz --mem 128M
+```
+
+The default command line selects `ttyS0`, `/init` and `reboot=k`. Use
+`--cmdline STR` to replace it. Supported images are x86-64 bzImages up to
+128 MiB with boot protocol 2.12 or newer. The kernel's entire `init_size`
+workspace, boot parameters, command line and initrd must fit below 1 GiB;
+E820 can describe additional RAM above that. The UART supports TX and IRQ4,
+with loopback RX for probing; stdin input is part of stage 4.
+
 Integration tests:
 
 ```bash
@@ -100,6 +116,12 @@ so every crash found once stays a regression test.
 mkdir -p fuzz-work/virtqueue
 ./build/fuzz/tests/fuzz/fuzz_virtqueue -max_total_time=300 \
     fuzz-work/virtqueue tests/fuzz/corpus/virtqueue
+
+# Stage 3 completion check (ASan + UBSan build above).
+meson compile -C build/fuzz
+mkdir -p fuzz-work/linux_loader
+./build/fuzz/tests/fuzz/fuzz_linux_loader -max_total_time=600 \
+    fuzz-work/linux_loader tests/fuzz/corpus/linux_loader
 ```
 
 ## Code quality

@@ -3,6 +3,9 @@
 unit_tests = [
   'test_memory',
   'test_bus',
+  'test_serial8250',
+  'test_serial8250_irq',
+  'test_i8042',
   'test_e820',
   'test_linux_loader',
   'test_pci_config',
@@ -16,3 +19,22 @@ foreach t : unit_tests
     suite: 'unit',
   )
 endforeach
+
+# Simulate KVM_RUN exits to verify PIO/MMIO routing without /dev/kvm.
+test('test_vcpu_io',
+  executable('test_vcpu_io', 'test_vcpu_io.c',
+    dependencies: minivmm_core_dep,
+    link_args: ['-Wl,--wrap=ioctl'],
+  ),
+  protocol: 'tap',
+  suite: 'unit',
+)
+
+test('test_cpu_setup',
+  executable('test_cpu_setup', 'test_cpu_setup.c',
+    dependencies: minivmm_core_dep,
+    link_args: ['-Wl,--wrap=ioctl'],
+  ),
+  protocol: 'tap',
+  suite: 'unit',
+)

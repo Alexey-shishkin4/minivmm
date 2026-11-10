@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 struct guest_memory;
+struct linux_boot;
 struct vcpu;
 
 /*
@@ -25,5 +26,9 @@ int cpu_setup_real_mode(const struct vcpu *vcpu, uint16_t ip);
 
 int cpu_setup_long_mode(const struct vcpu *vcpu,
                         const struct guest_memory *mem);
+
+/* Linux 64-bit boot ABI: CS=0x10, DS=0x18, RSI=boot_params, IF=0. */
+int cpu_setup_linux(const struct vcpu *vcpu, const struct guest_memory *mem,
+                    const struct linux_boot *boot);
 
 #endif /* MINIVMM_X86_CPU_SETUP_H */

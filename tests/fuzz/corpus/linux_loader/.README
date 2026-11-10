@@ -1,1 +1,9 @@
-Corpus and crash regressions for fuzz_linux_loader. Inputs are replayed by `meson test --suite fuzz-regression`.
+Corpus and crash regressions for fuzz_linux_loader.
+
+valid-small.bzImage: synthetic x86-64 image reaching boot layout planning.
+truncated-setup.bzImage: setup_sects=0 default extends past the file.
+overflow-address.bzImage: preferred kernel address near UINT64_MAX.
+low-initrd-limit.bzImage: initrd_addr_max below the kernel workspace.
+
+Inputs are replayed by meson test --suite fuzz-regression.
+Write generated inputs to a separate FIRST corpus directory when fuzzing.

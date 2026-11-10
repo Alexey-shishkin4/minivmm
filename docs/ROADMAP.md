@@ -46,7 +46,7 @@
 
 **Готово, когда** `test_longmode_hello` проходит, а payload проверяет `cpuid` и пишет в MMIO.
 
-**Понять и записать в `docs/notes/`**: что делает процессор при VM entry/exit, чем вложенная виртуализация (WSL → KVM) отличается от bare metal, почему identity map работает.
+**Понять и записать в [`docs/notes/`](notes/README.md)**: что делает процессор при VM entry/exit, чем вложенная виртуализация (WSL → KVM) отличается от bare metal, почему identity map работает.
 
 ## Этап 3. Загрузка Linux до консоли (2 недели)
 
@@ -58,6 +58,14 @@
 - `devices/i8042.c`: сброс через порт 0x64 → выход из VMM. Команда гостя `reboot` даёт чистое завершение.
 - `guest/init/init.c`: баннер `minivmm-init: ready`, затем poweroff или reboot.
 
+**Реализовано 2026-11-10:** загрузчик и E820, TX UART с IRQ4, i8042 reset,
+CLI `--kernel/--initrd/--cmdline`, настройки Linux 64-bit boot ABI.
+PIC/IOAPIC/LAPIC и PIT из этапа 4 подключены уже здесь для загрузки Linux.
+В dev-VM прошли `test_boot_to_init` с 64/128/512 МиБ RAM и все 6 payload-тестов.
+Unit-тесты загрузчика и E820 проходят; фаззер под ASan+UBSan отработал
+601 секунду (173 029 590 входов) без падений. Критерии готовности выполнены.
+Описание адресов и проверок — в [заметках этапа 3](notes/linux-boot.md).
+
 **Готово, когда** `test_boot_to_init` проходит, `test_linux_loader` и `test_e820` зелёные, а `fuzz_linux_loader` 10 минут работает под ASan без падений.
 
 **Подсказка**: если ядро молчит — `earlyprintk=serial,ttyS0,115200`, `KVM_EXIT_DEBUG` с single-step или `gdb vmlinux`. vmlinux с символами лежит в `guest/out/`.
@@ -66,6 +74,7 @@
 
 **Сделать**
 - `KVM_CREATE_IRQCHIP` (PIC и IOAPIC в ядре), `KVM_CREATE_PIT2`, `KVM_IRQ_LINE`.
+  Базовое подключение и IRQ4 для TX уже реализованы в этапе 3.
 - UART: приём (RX) из stdin через `util/event_loop.c` (epoll), прерывания THRE/RDA, терминал в raw mode.
 - Корректная остановка: SIGINT, выход vCPU из `KVM_RUN` через `immediate_exit`.
 

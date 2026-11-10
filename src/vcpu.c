@@ -14,9 +14,6 @@
 #include "util/log.h"
 #include "vmm.h"
 
-/* Stage 1 stand-in for the 8250 UART: bytes written here go to stdout. */
-#define DEBUG_PORT 0x3f8
-
 #define EXIT_NAME(name) [name] = #name
 
 static const char *const exit_names[] = {
@@ -53,6 +50,7 @@ int vcpu_create(struct vcpu *vcpu, const struct vmm *vm, unsigned id)
     void *run;
 
     *vcpu = (struct vcpu){
+        .vm = vm,
         .fd = -1,
         .id = id,
         .run_size = vm->kvm.vcpu_mmap_size,
@@ -96,38 +94,88 @@ void vcpu_destroy(struct vcpu *vcpu)
     }
 }
 
-static void handle_io(struct kvm_run *run)
+static int handle_io(const struct vcpu *vcpu)
 {
-    /* The data sits in the same mapping; count > 1 for rep ins/outs. */
-    uint8_t *data = (uint8_t *)run + run->io.data_offset;
-    const size_t len = (size_t)run->io.size * run->io.count;
-    const bool out = run->io.direction == KVM_EXIT_IO_OUT;
+    struct kvm_run *run = vcpu->run;
+    const size_t size = run->io.size;
+    const uint64_t offset = run->io.data_offset;
+    bool unhandled = false;
+    bool out;
+    uint8_t *data;
 
-    if (out && run->io.port == DEBUG_PORT && run->io.size == 1) {
-        fwrite(data, 1, len, stdout);
-        return;
+    if ((size != 1 && size != 2 && size != 4) || run->io.count == 0 ||
+        (run->io.direction != KVM_EXIT_IO_IN &&
+         run->io.direction != KVM_EXIT_IO_OUT)) {
+        log_error("invalid KVM_EXIT_IO metadata");
+        errno = EINVAL;
+        return -1;
     }
-    if (!out) {
-        /* Nobody decodes this port: an empty ISA bus reads as all ones. */
-        memset(data, 0xff, len);
+    if (offset > vcpu->run_size ||
+        run->io.count > (vcpu->run_size - offset) / size) {
+        log_error("PIO data lies outside kvm_run mapping");
+        errno = EINVAL;
+        return -1;
     }
-    log_warn("unhandled %s port 0x%x, size %u, count %u", out ? "out" : "in",
-             run->io.port, run->io.size, run->io.count);
+    data = (uint8_t *)run + (size_t)offset;
+    out = run->io.direction == KVM_EXIT_IO_OUT;
+
+    /* REP repeats accesses to the same port; only the data pointer moves. */
+    for (uint32_t i = 0; i < run->io.count; i++) {
+        uint8_t *element = data + (size_t)i * size;
+        const enum bus_result result =
+            bus_access(&vcpu->vm->pio_bus, run->io.port, element, size, out);
+
+        if (result == BUS_ERROR) {
+            log_errno("PIO %s port 0x%x, size %zu", out ? "out" : "in",
+                      run->io.port, size);
+            return -1;
+        }
+        if (result == BUS_UNMAPPED) {
+            unhandled = true;
+            if (!out) {
+                memset(element, 0xff, size);
+            }
+        }
+    }
+    if (unhandled) {
+        log_warn("unhandled %s port 0x%x, size %u, count %u",
+                 out ? "out" : "in", run->io.port, run->io.size, run->io.count);
+    }
+    return 0;
 }
 
-static void handle_mmio(struct kvm_run *run)
+static int handle_mmio(const struct vcpu *vcpu)
 {
+    struct kvm_run *run = vcpu->run;
     uint64_t value = 0;
+    enum bus_result result;
 
+    if (run->mmio.len == 0 || run->mmio.len > sizeof(run->mmio.data) ||
+        run->mmio.is_write > 1) {
+        log_error("invalid KVM_EXIT_MMIO metadata");
+        errno = EINVAL;
+        return -1;
+    }
     if (run->mmio.is_write) {
         memcpy(&value, run->mmio.data, run->mmio.len);
-    } else {
-        /* Same as for ports: unassigned physical addresses read as ones. */
+    }
+    result = bus_access(&vcpu->vm->mmio_bus, run->mmio.phys_addr,
+                        run->mmio.data, run->mmio.len, run->mmio.is_write != 0);
+    if (result == BUS_ERROR) {
+        log_errno("MMIO %s at 0x%llx", run->mmio.is_write ? "write" : "read",
+                  (unsigned long long)run->mmio.phys_addr);
+        return -1;
+    }
+    if (result == BUS_HANDLED) {
+        return 0;
+    }
+    if (!run->mmio.is_write) {
         memset(run->mmio.data, 0xff, run->mmio.len);
     }
     log_warn("unhandled mmio %s 0x%llx, len %u, value 0x%" PRIx64,
              run->mmio.is_write ? "write" : "read",
              (unsigned long long)run->mmio.phys_addr, run->mmio.len, value);
+    return 0;
 }
 
 static void log_internal_error(const struct kvm_run *run)
@@ -145,17 +193,39 @@ static void log_internal_error(const struct kvm_run *run)
 }
 
 /* Returns true if the guest may run on, otherwise sets *stop. */
-static bool handle_exit(struct kvm_run *run, enum vcpu_stop *stop)
+static bool handle_exit(const struct vcpu *vcpu, enum vcpu_stop *stop)
 {
+    struct kvm_run *run = vcpu->run;
+
     switch (run->exit_reason) {
     case KVM_EXIT_IO:
-        handle_io(run);
-        return true;
+        if (handle_io(vcpu) == 0) {
+            return true;
+        }
+        *stop = VCPU_STOP_ERROR;
+        return false;
     case KVM_EXIT_MMIO:
-        handle_mmio(run);
-        return true;
+        if (handle_mmio(vcpu) == 0) {
+            return true;
+        }
+        *stop = VCPU_STOP_ERROR;
+        return false;
     case KVM_EXIT_HLT:
+        if (vcpu->vm->has_irqchip) {
+            log_error("unexpected userspace HLT with in-kernel irqchip");
+            *stop = VCPU_STOP_ERROR;
+            return false;
+        }
         *stop = VCPU_STOP_HLT;
+        return false;
+    case KVM_EXIT_SYSTEM_EVENT:
+        if (vcpu->vm->has_irqchip &&
+            run->system_event.type == KVM_SYSTEM_EVENT_RESET) {
+            *stop = VCPU_STOP_REBOOT;
+            return false;
+        }
+        log_error("unsupported KVM system event %u", run->system_event.type);
+        *stop = VCPU_STOP_ERROR;
         return false;
     case KVM_EXIT_SHUTDOWN:
         log_error("guest shutdown (triple fault)");
@@ -262,7 +332,7 @@ enum vcpu_stop vcpu_run(struct vcpu *vcpu)
     log_set_vcpu((int)vcpu->id);
     for (;;) {
         if (ioctl(vcpu->fd, KVM_RUN, 0UL) < 0) {
-            /* A signal is pending (exit_reason is KVM_EXIT_INTR): re-enter. */
+            /* Retry an interrupted KVM_RUN without dispatching exit_reason. */
             if (errno == EINTR) {
                 continue;
             }
@@ -270,12 +340,29 @@ enum vcpu_stop vcpu_run(struct vcpu *vcpu)
             stop = VCPU_STOP_ERROR;
             break;
         }
-        if (!handle_exit(vcpu->run, &stop)) {
+        if (!handle_exit(vcpu, &stop)) {
+            break;
+        }
+        if (vcpu->vm->i8042.reset_requested) {
+            /* Finish the pending OUT before stopping. KVM checks immediate_exit
+             * after completing userspace I/O, without executing another insn. */
+            vcpu->run->immediate_exit = 1;
+            const int ret = ioctl(vcpu->fd, KVM_RUN, 0UL);
+            const int saved = errno;
+            vcpu->run->immediate_exit = 0;
+            if (ret < 0 && saved == EINTR) {
+                log_info("guest requested reboot via i8042");
+                stop = VCPU_STOP_REBOOT;
+            } else {
+                errno = ret < 0 ? saved : EIO;
+                log_errno("complete i8042 reset I/O");
+                stop = VCPU_STOP_ERROR;
+            }
             break;
         }
     }
 
-    if (stop != VCPU_STOP_HLT) {
+    if (stop != VCPU_STOP_HLT && stop != VCPU_STOP_REBOOT) {
         vcpu_dump_regs(vcpu);
     }
     log_set_vcpu(-1);
