@@ -86,16 +86,46 @@ static void write_mcr(struct serial8250 *uart, uint8_t value)
     }
 }
 
+static void receive_byte(struct serial8250 *uart, uint8_t value)
+{
+    if (uart->rx_ready) {
+        /* Retain the unread byte and report a hardware receive overrun. */
+        uart->lsr_errors |= UART_LSR_OE;
+    } else {
+        uart->rx_byte = value;
+        uart->rx_ready = true;
+    }
+}
+
+bool serial8250_can_receive(const struct serial8250 *uart)
+{
+    return uart != NULL && !uart->rx_ready && (uart->mcr & UART_MCR_LOOP) == 0;
+}
+
+int serial8250_receive(struct serial8250 *uart, uint8_t value)
+{
+    if (uart == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (!serial8250_can_receive(uart)) {
+        return 0;
+    }
+
+    receive_byte(uart, value);
+
+    if (update_irq(uart) < 0) {
+        return -1;
+    }
+
+    return 1;
+}
+
 static int transmit(struct serial8250 *uart, uint8_t value)
 {
     if (uart->mcr & UART_MCR_LOOP) {
-        if (uart->rx_ready) {
-            /* Retain the unread byte and report overrun. */
-            uart->lsr_errors |= UART_LSR_OE;
-        } else {
-            uart->rx_byte = value;
-            uart->rx_ready = true;
-        }
+        receive_byte(uart, value);
         return 0;
     }
 
