@@ -9,6 +9,8 @@ layer between `ioctl(KVM_RUN)` and a guest driver.
 > Linux prints `minivmm-init: ready` and reboots through i8042; interactive
 > input, PCI and virtio are planned in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+For first-time setup on another machine, see [Running minivmm](docs/RUNNING.md).
+
 ## Architecture
 
 ```mermaid

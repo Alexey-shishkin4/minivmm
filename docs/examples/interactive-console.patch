@@ -1,0 +1,1108 @@
+--- a/src/main.c
++++ b/src/main.c
+@@ -36,6 +36,7 @@
+     const char *cmdline;
+     struct vmm_config vm;
+     bool long_mode;
++    bool interactive;
+ };
+ 
+ static void usage(FILE *out, const char *prog)
+@@ -52,6 +53,7 @@
+         "reboot=k)\n"
+         "  -m, --mem SIZE      guest RAM, suffix K, M or G (default 128M)\n"
+         "      --mode MODE     real (default) or long\n"
++        "      --interactive   stdin to UART; raw TTY, Ctrl-] exits VMM\n"
+         "  -v, --verbose       debug logging\n"
+         "  -h, --help          show this help\n",
+         prog, prog, RAW_LOAD_ADDR);
+@@ -102,10 +104,11 @@
+ /* Returns 0 to run, 1 if --help was printed, -1 on a usage error. */
+ static int parse_options(int argc, char **argv, struct options *opts)
+ {
+-    enum { OPT_MODE = 256 };
++    enum { OPT_MODE = 256, OPT_INTERACTIVE };
+ 
+     static const struct option long_options[] = {
+         {"mode", required_argument, NULL, OPT_MODE},
++        {"interactive", no_argument, NULL, OPT_INTERACTIVE},
+         {"payload", required_argument, NULL, 'p'},
+         {"kernel", required_argument, NULL, 'k'},
+         {"initrd", required_argument, NULL, 'i'},
+@@ -157,6 +160,9 @@
+                 return -1;
+             }
+             break;
++        case OPT_INTERACTIVE:
++            opts->interactive = true;
++            break;
+         case 'v':
+             log_set_level(LOG_LEVEL_DEBUG);
+             break;
+@@ -182,6 +188,13 @@
+         log_error(
+             "--initrd/--cmdline require --kernel; --mode requires --payload");
+         return -1;
++    }
++    if (opts->interactive && opts->kernel == NULL) {
++        log_error("--interactive requires --kernel");
++        return -1;
++    }
++    if (opts->interactive && !cmdline_given) {
++        opts->cmdline = DEFAULT_CMDLINE " minivmm.shell=1";
+     }
+     opts->vm.linux_boot = opts->kernel != NULL;
+     return 0;
+@@ -219,9 +232,10 @@
+     } else if (cpu_setup_real_mode(&vcpu, RAW_LOAD_ADDR) < 0) {
+         goto out_vcpu;
+     }
+-    const enum vcpu_stop stop = vcpu_run(&vcpu);
+-    if (opts->vm.linux_boot ? stop == VCPU_STOP_REBOOT
+-                            : stop == VCPU_STOP_HLT) {
++    const enum vcpu_stop stop = vmm_run(&vm, &vcpu, opts->interactive);
++    if (stop == VCPU_STOP_REQUESTED ||
++        (opts->vm.linux_boot ? stop == VCPU_STOP_REBOOT
++                             : stop == VCPU_STOP_HLT)) {
+         ret = EXIT_SUCCESS;
+     }
+ 
+--- a/src/vmm.c
++++ b/src/vmm.c
+@@ -1,15 +1,98 @@
+ #include "vmm.h"
+ 
+ #include <errno.h>
++#include <fcntl.h>
+ #include <inttypes.h>
+ #include <linux/kvm.h>
++#include <signal.h>
++#include <stdatomic.h>
++#include <string.h>
++#include <sys/epoll.h>
++#include <sys/eventfd.h>
+ #include <sys/ioctl.h>
++#include <sys/signalfd.h>
++#include <termios.h>
+ #include <unistd.h>
+ 
++#include "util/event_loop.h"
+ #include "util/log.h"
+ 
+ #define VMM_TSS_ADDR 0xFFFBD000UL
+ #define COM1_BASE 0x3f8
++
++#define CONSOLE_INPUT_CAPACITY 4096U
++#define VCPU_KICK_SIGNAL SIGUSR1
++
++struct vmm_console {
++    struct vmm *vm;
++    struct vcpu *vcpu;
++    struct event_loop loop;
++    int input_fd;
++    int space_fd;
++    int signal_fd;
++    pthread_t worker;
++    bool worker_started;
++    atomic_bool stop_requested;
++    enum vcpu_stop worker_stop;
++    uint8_t input[CONSOLE_INPUT_CAPACITY];
++    size_t head;
++    size_t count;
++    bool input_paused;
++    bool rx_waiting; /* protected by vm->serial_lock */
++};
++
++/* Installed before the worker starts; only that thread unblocks SIGUSR1. */
++static _Thread_local volatile uint8_t *worker_immediate_exit;
++
++static void kick_vcpu(int signo)
++{
++    (void)signo;
++    if (worker_immediate_exit != NULL) {
++        *worker_immediate_exit = 1;
++    }
++}
++
++static int notify(int fd)
++{
++    const uint64_t one = 1;
++    for (;;) {
++        const ssize_t n = write(fd, &one, sizeof(one));
++        if (n == (ssize_t)sizeof(one) || (n < 0 && errno == EAGAIN)) {
++            return 0;
++        }
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n >= 0) {
++            errno = EIO;
++        }
++        return -1;
++    }
++}
++
++static int serial_access(void *opaque, uint64_t offset, void *data, size_t len,
++                         bool is_write)
++{
++    struct vmm *vm = opaque;
++    int err = pthread_mutex_lock(&vm->serial_lock);
++    if (err != 0) {
++        errno = err;
++        return -1;
++    }
++    int ret = serial8250_access(&vm->serial, offset, data, len, is_write);
++    if (ret == 0 && vm->console != NULL && vm->console->rx_waiting &&
++        serial8250_can_receive(&vm->serial)) {
++        ret = notify(vm->console->space_fd);
++    }
++    const int saved = errno;
++    err = pthread_mutex_unlock(&vm->serial_lock);
++    if (ret == 0 && err != 0) {
++        errno = err;
++        return -1;
++    }
++    errno = saved;
++    return ret;
++}
+ 
+ static int serial_irq(void *opaque, bool level)
+ {
+@@ -65,15 +148,22 @@
+     bus_init(&vm->pio_bus, UINT16_MAX);
+     bus_init(&vm->mmio_bus, UINT64_MAX);
+     serial8250_init(&vm->serial, STDOUT_FILENO);
++    const int lock_error = pthread_mutex_init(&vm->serial_lock, NULL);
++    if (lock_error != 0) {
++        log_error("initialize UART mutex: %s", strerror(lock_error));
++        errno = lock_error;
++        goto fail;
++    }
++    vm->serial_lock_ready = true;
+ 
+     if (bus_register(&vm->pio_bus, COM1_BASE, SERIAL8250_REG_COUNT,
+-                     serial8250_access, &vm->serial) < 0) {
++                     serial_access, vm) < 0) {
+         log_errno("register COM1 UART");
+-        return -1;
++        goto fail;
+     }
+ 
+     if (kvm_open(&vm->kvm) < 0) {
+-        return -1;
++        goto fail;
+     }
+ 
+     vm->vm_fd = create_vm(vm->kvm.fd);
+@@ -122,4 +212,337 @@
+     /* Only now: while the VM lives, KVM may still access this memory. */
+     guest_memory_destroy(&vm->mem);
+     kvm_close(&vm->kvm);
+-}
++    if (vm->serial_lock_ready) {
++        const int err = pthread_mutex_destroy(&vm->serial_lock);
++        if (err != 0) {
++            log_error("destroy UART mutex: %s", strerror(err));
++        }
++        vm->serial_lock_ready = false;
++    }
++}
++
++bool vmm_stop_requested(const struct vmm *vm)
++{
++    return vm->console != NULL &&
++           atomic_load_explicit(&vm->console->stop_requested,
++                                memory_order_acquire);
++}
++
++static int request_stop(struct vmm_console *console)
++{
++    atomic_store_explicit(&console->stop_requested, true, memory_order_release);
++    int err = 0;
++    if (console->worker_started) {
++        err = pthread_kill(console->worker, VCPU_KICK_SIGNAL);
++    }
++    const int ret = event_loop_stop(&console->loop);
++    if (err != 0 && err != ESRCH) {
++        errno = err;
++        return -1;
++    }
++    return ret;
++}
++
++static int on_input(struct event_loop *loop, int fd, uint32_t events,
++                    void *opaque);
++
++static int flush_input(struct vmm_console *console)
++{
++    struct vmm *vm = console->vm;
++    int err = pthread_mutex_lock(&vm->serial_lock);
++    if (err != 0) {
++        errno = err;
++        return -1;
++    }
++    int ret = 0;
++    while (console->count != 0) {
++        const int accepted =
++            serial8250_receive(&vm->serial, console->input[console->head]);
++        if (accepted < 0) {
++            ret = -1;
++            break;
++        }
++        if (accepted == 0) {
++            break;
++        }
++        console->head = (console->head + 1U) % CONSOLE_INPUT_CAPACITY;
++        console->count--;
++    }
++    console->rx_waiting = console->count != 0;
++    const int saved = errno;
++    err = pthread_mutex_unlock(&vm->serial_lock);
++    if (ret < 0) {
++        errno = saved;
++        return -1;
++    }
++    if (err != 0) {
++        errno = err;
++        return -1;
++    }
++    if (console->input_paused && console->count < CONSOLE_INPUT_CAPACITY) {
++        if (event_loop_add(&console->loop, console->input_fd, EPOLLIN, on_input,
++                           console) < 0) {
++            return -1;
++        }
++        console->input_paused = false;
++    }
++    return 0;
++}
++
++static int on_space(struct event_loop *loop, int fd, uint32_t events,
++                    void *opaque)
++{
++    (void)loop;
++    (void)events;
++    for (;;) {
++        uint64_t value;
++        const ssize_t n = read(fd, &value, sizeof(value));
++        if (n == (ssize_t)sizeof(value)) {
++            continue;
++        }
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n < 0 && errno == EAGAIN) {
++            return flush_input(opaque);
++        }
++        if (n >= 0) {
++            errno = EIO;
++        }
++        return -1;
++    }
++}
++
++static int on_input(struct event_loop *loop, int fd, uint32_t events,
++                    void *opaque)
++{
++    struct vmm_console *console = opaque;
++    uint8_t bytes[256];
++
++    /* Bound work per callback, even if the producer never stops writing. */
++    for (unsigned batch = 0; batch < 16; batch++) {
++        size_t space = CONSOLE_INPUT_CAPACITY - console->count;
++        if (space == 0) {
++            if (event_loop_remove(loop, fd) < 0) {
++                return -1;
++            }
++            console->input_paused = true;
++            return 0;
++        }
++        if (space > sizeof(bytes)) {
++            space = sizeof(bytes);
++        }
++        const ssize_t n = read(fd, bytes, space);
++        if (n > 0) {
++            for (size_t i = 0; i < (size_t)n; i++) {
++                if (bytes[i] == 0x1d) { /* Ctrl-] exits the host VMM. */
++                    return request_stop(console);
++                }
++                const size_t tail =
++                    (console->head + console->count) % CONSOLE_INPUT_CAPACITY;
++                console->input[tail] = bytes[i];
++                console->count++;
++            }
++            if (flush_input(console) < 0) {
++                return -1;
++            }
++            continue;
++        }
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n == 0 || (n < 0 && errno == EIO)) {
++            return request_stop(console);
++        }
++        if (errno == EAGAIN) {
++            return (events & (EPOLLHUP | EPOLLERR)) != 0 ? request_stop(console)
++                                                         : 0;
++        }
++        return -1;
++    }
++    return 0;
++}
++
++static int on_signal(struct event_loop *loop, int fd, uint32_t events,
++                     void *opaque)
++{
++    (void)loop;
++    (void)events;
++    bool received = false;
++    for (;;) {
++        struct signalfd_siginfo info;
++        const ssize_t n = read(fd, &info, sizeof(info));
++        if (n == (ssize_t)sizeof(info)) {
++            received = true;
++            continue;
++        }
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n < 0 && errno == EAGAIN) {
++            return received ? request_stop(opaque) : 0;
++        }
++        if (n >= 0) {
++            errno = EIO;
++        }
++        return -1;
++    }
++}
++
++static void *run_vcpu(void *opaque)
++{
++    struct vmm_console *console = opaque;
++    sigset_t kick;
++    sigemptyset(&kick);
++    sigaddset(&kick, VCPU_KICK_SIGNAL);
++    worker_immediate_exit = &console->vcpu->run->immediate_exit;
++    const int err = pthread_sigmask(SIG_UNBLOCK, &kick, NULL);
++    if (err != 0) {
++        log_error("unblock vCPU kick signal: %s", strerror(err));
++        console->worker_stop = VCPU_STOP_ERROR;
++    } else {
++        console->worker_stop = vcpu_run(console->vcpu);
++    }
++    worker_immediate_exit = NULL;
++    if (event_loop_stop(&console->loop) < 0) {
++        log_errno("stop console event loop");
++    }
++    return NULL;
++}
++
++enum vcpu_stop vmm_run(struct vmm *vm, struct vcpu *vcpu, bool interactive)
++{
++    if (!interactive) {
++        return vcpu_run(vcpu);
++    }
++    if (!vm->has_irqchip || !isatty(STDIN_FILENO)) {
++        log_error("interactive Linux console requires a TTY on stdin");
++        return VCPU_STOP_ERROR;
++    }
++    struct vmm_console console = {
++        .vm = vm,
++        .vcpu = vcpu,
++        .input_fd = -1,
++        .space_fd = -1,
++        .signal_fd = -1,
++        .worker_stop = VCPU_STOP_ERROR,
++    };
++    struct termios original;
++    sigset_t signals;
++    sigset_t blocked;
++    sigset_t old_mask;
++    struct sigaction old_action;
++    struct sigaction action = {.sa_handler = kick_vcpu};
++    bool mask_saved = false;
++    bool action_saved = false;
++    bool raw_active = false;
++    bool loop_ready = false;
++    enum vcpu_stop result = VCPU_STOP_ERROR;
++    atomic_init(&console.stop_requested, false);
++
++    sigemptyset(&signals);
++    sigaddset(&signals, SIGINT);
++    sigaddset(&signals, SIGTERM);
++    blocked = signals;
++    sigaddset(&blocked, VCPU_KICK_SIGNAL);
++    int err = pthread_sigmask(SIG_BLOCK, &blocked, &old_mask);
++    if (err != 0) {
++        log_error("block console signals: %s", strerror(err));
++        return VCPU_STOP_ERROR;
++    }
++    mask_saved = true;
++    sigemptyset(&action.sa_mask);
++    if (sigaction(VCPU_KICK_SIGNAL, &action, &old_action) < 0) {
++        goto fail;
++    }
++    action_saved = true;
++    if (event_loop_init(&console.loop) < 0) {
++        goto fail;
++    }
++    loop_ready = true;
++    /* A separate open file description avoids making stdout nonblocking when
++     * stdin/stdout were both dup'ed from the same PTY slave. dup() is not enough. */
++    console.input_fd =
++        open("/proc/self/fd/0", O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
++    console.space_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
++    console.signal_fd = signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC);
++    if (console.input_fd < 0 || console.space_fd < 0 || console.signal_fd < 0) {
++        goto fail;
++    }
++    if (event_loop_add(&console.loop, console.input_fd, EPOLLIN, on_input,
++                       &console) < 0 ||
++        event_loop_add(&console.loop, console.space_fd, EPOLLIN, on_space,
++                       &console) < 0 ||
++        event_loop_add(&console.loop, console.signal_fd, EPOLLIN, on_signal,
++                       &console) < 0 ||
++        tcgetattr(STDIN_FILENO, &original) < 0) {
++        goto fail;
++    }
++    struct termios raw = original;
++    cfmakeraw(&raw);
++    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0) {
++        goto fail;
++    }
++    raw_active = true;
++    vm->console = &console;
++    err = pthread_create(&console.worker, NULL, run_vcpu, &console);
++    if (err != 0) {
++        errno = err;
++        goto fail;
++    }
++    console.worker_started = true;
++    const int loop_result = event_loop_run(&console.loop);
++    if (loop_result < 0) {
++        log_errno("console event loop");
++    }
++    const int stop_result = request_stop(&console);
++    if (stop_result < 0) {
++        log_errno("request vCPU stop");
++    }
++    err = pthread_join(console.worker, NULL);
++    if (err != 0) {
++        /* Releasing the stack/VM while the worker might still run is unsafe. */
++        if (raw_active) {
++            (void)tcsetattr(STDIN_FILENO, TCSANOW, &original);
++        }
++        die("join vCPU worker: %s", strerror(err));
++    }
++    console.worker_started = false;
++    if (loop_result == 0 && stop_result == 0) {
++        result = console.worker_stop;
++    }
++    goto out;
++
++fail:
++    log_errno("initialize interactive console");
++out:
++    vm->console = NULL;
++    if (raw_active && tcsetattr(STDIN_FILENO, TCSANOW, &original) < 0) {
++        log_errno("restore host terminal");
++        result = VCPU_STOP_ERROR;
++    }
++    if (loop_ready) {
++        event_loop_destroy(&console.loop);
++    }
++    if (console.input_fd >= 0) {
++        close(console.input_fd);
++    }
++    if (console.space_fd >= 0) {
++        close(console.space_fd);
++    }
++    if (console.signal_fd >= 0) {
++        close(console.signal_fd);
++    }
++    if (action_saved && sigaction(VCPU_KICK_SIGNAL, &old_action, NULL) < 0) {
++        log_errno("restore kick signal handler");
++        result = VCPU_STOP_ERROR;
++    }
++    if (mask_saved) {
++        err = pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
++        if (err != 0) {
++            log_error("restore signal mask: %s", strerror(err));
++            result = VCPU_STOP_ERROR;
++        }
++    }
++    return result;
++}
+--- a/src/vmm.h
++++ b/src/vmm.h
+@@ -1,14 +1,15 @@
+ /*
+  * Top-level VM object: owns KVM fds, guest memory, vCPUs and device buses.
+  *
+- * TODO: vcpu array and vmm_run() (with vcpu.c)
+- * TODO: PCI root, event loop
+- * TODO: orderly shutdown: guest reboot/poweroff, SIGINT, vCPU errors
++ * TODO: vcpu array and SMP lifecycle
++ * TODO: PCI root
++ * TODO: guest ACPI poweroff
+  */
+ 
+ #ifndef MINIVMM_VMM_H
+ #define MINIVMM_VMM_H
+ 
++#include <pthread.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+@@ -17,6 +18,9 @@
+ #include "devices/serial8250.h"
+ #include "kvm.h"
+ #include "memory.h"
++#include "vcpu.h"
++
++struct vmm_console;
+ 
+ struct vmm_config {
+     uint64_t ram_size; /* bytes, page-aligned */
+@@ -32,6 +36,9 @@
+     struct serial8250 serial;
+     struct i8042 i8042;
+     bool has_irqchip;
++    pthread_mutex_t serial_lock;
++    bool serial_lock_ready;
++    struct vmm_console *console; /* borrowed while vmm_run() is active */
+ };
+ 
+ /*
+@@ -43,4 +50,11 @@
+ /* Release in reverse order of creation. Safe on a partly created vmm. */
+ void vmm_destroy(struct vmm *vm);
+ 
++/* Interactive mode owns the host terminal and runs one vCPU worker.
++ * Raw payloads/non-interactive Linux keep the original synchronous path. */
++enum vcpu_stop vmm_run(struct vmm *vm, struct vcpu *vcpu, bool interactive);
++
++/* Called by the vCPU thread; console is stable until that thread is joined. */
++bool vmm_stop_requested(const struct vmm *vm);
++
+ #endif /* MINIVMM_VMM_H */
+--- a/src/vcpu.c
++++ b/src/vcpu.c
+@@ -3,6 +3,7 @@
+ #include <errno.h>
+ #include <inttypes.h>
+ #include <linux/kvm.h>
++#include <stdatomic.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -331,6 +332,14 @@
+ 
+     log_set_vcpu((int)vcpu->id);
+     for (;;) {
++        /* Clear before checking the stop flag. A later kick sets this byte
++         * in the signal handler, closing the check-to-KVM_RUN race. */
++        vcpu->run->immediate_exit = 0;
++        atomic_signal_fence(memory_order_seq_cst);
++        if (vmm_stop_requested(vcpu->vm)) {
++            stop = VCPU_STOP_REQUESTED;
++            break;
++        }
+         if (ioctl(vcpu->fd, KVM_RUN, 0UL) < 0) {
+             /* Retry an interrupted KVM_RUN without dispatching exit_reason. */
+             if (errno == EINTR) {
+@@ -362,7 +371,8 @@
+         }
+     }
+ 
+-    if (stop != VCPU_STOP_HLT && stop != VCPU_STOP_REBOOT) {
++    if (stop != VCPU_STOP_HLT && stop != VCPU_STOP_REBOOT &&
++        stop != VCPU_STOP_REQUESTED) {
+         vcpu_dump_regs(vcpu);
+     }
+     log_set_vcpu(-1);
+--- a/src/vcpu.h
++++ b/src/vcpu.h
+@@ -3,7 +3,6 @@
+  *
+  * TODO: thread per vCPU (stage 7, SMP)
+  * TODO: guest poweroff (only explicit reset is currently supported)
+- * TODO: kick a vCPU out of KVM_RUN (signal + immediate_exit)
+  * TODO: per-exit-reason counters and timing for the performance work
+  */
+ 
+@@ -25,10 +24,11 @@
+ 
+ /* Why vcpu_run() returned. */
+ enum vcpu_stop {
+-    VCPU_STOP_HLT,      /* raw guest executed hlt without in-kernel irqchip */
+-    VCPU_STOP_REBOOT,   /* explicit platform reset, not a triple fault */
+-    VCPU_STOP_SHUTDOWN, /* triple fault: the CPU gave up on the guest */
+-    VCPU_STOP_ERROR,    /* failed entry, internal error, unhandled exit */
++    VCPU_STOP_HLT,       /* raw guest executed hlt without in-kernel irqchip */
++    VCPU_STOP_REQUESTED, /* host requested an orderly stop */
++    VCPU_STOP_REBOOT,    /* explicit platform reset, not a triple fault */
++    VCPU_STOP_SHUTDOWN,  /* triple fault: the CPU gave up on the guest */
++    VCPU_STOP_ERROR,     /* failed entry, internal error, unhandled exit */
+ };
+ 
+ /*
+--- a/guest/init/init.c
++++ b/guest/init/init.c
+@@ -6,26 +6,31 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/ioctl.h>
+ #include <sys/mount.h>
+ #include <sys/reboot.h>
++#include <sys/wait.h>
+ #include <termios.h>
+ #include <unistd.h>
+ 
+-
+-static _Noreturn void fail_errno(const char *operation) {
++static _Noreturn void fail_errno(const char *operation)
++{
+     const int saved = errno;
+ 
+-    (void)dprintf(STDERR_FILENO, "minivmm-init: FAIL: %s: %s\n", operation, strerror(saved));
++    (void)dprintf(STDERR_FILENO, "minivmm-init: FAIL: %s: %s\n", operation,
++                  strerror(saved));
+ 
+     for (;;) {
+         pause();
+     }
+ }
+ 
+-static void setup_console(void) {
++static void setup_console(void)
++{
+     const int fd = open("/dev/console", O_RDWR | O_NOCTTY);
+ 
+     if (fd < 0) {
+@@ -33,7 +38,7 @@
+     }
+ 
+     for (int target = STDIN_FILENO; target <= STDERR_FILENO; target++) {
+-        if (dup2(fd,target) < 0) {
++        if (dup2(fd, target) < 0) {
+             fail_errno("dup2 /dev/console");
+         }
+     }
+@@ -43,9 +48,97 @@
+     }
+ }
+ 
+-static void message(const char *text) {
++static void message(const char *text)
++{
+     if (dprintf(STDOUT_FILENO, "minivmm-init: %s\n", text) < 0) {
+         fail_errno("write console");
++    }
++}
++
++static bool shell_requested(void)
++{
++    char line[4096];
++    FILE *file = fopen("/proc/cmdline", "r");
++    if (file == NULL) {
++        fail_errno("open /proc/cmdline");
++    }
++    if (fgets(line, sizeof(line), file) == NULL) {
++        if (!ferror(file)) {
++            errno = EIO;
++        }
++        fail_errno("read /proc/cmdline");
++    }
++    if (fclose(file) != 0) {
++        fail_errno("close /proc/cmdline");
++    }
++    char *save;
++    for (char *arg = strtok_r(line, " \t\r\n", &save); arg != NULL;
++         arg = strtok_r(NULL, " \t\r\n", &save)) {
++        if (strcmp(arg, "minivmm.shell=1") == 0) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static _Noreturn void child_fail(const char *operation)
++{
++    const int saved = errno;
++    (void)dprintf(STDERR_FILENO, "minivmm-init: FAIL: shell %s: %s\n",
++                  operation, strerror(saved));
++    _exit(127);
++}
++
++static void run_shell(void)
++{
++    const pid_t child = fork();
++    if (child < 0) {
++        fail_errno("fork shell");
++    }
++    if (child == 0) {
++        if (setsid() < 0) {
++            child_fail("setsid");
++        }
++        /* /dev/console is for kernel console I/O. ttyS0 is the actual TTY
++         * whose controlling session/foreground group enables job control. */
++        const int fd = open("/dev/ttyS0", O_RDWR | O_NOCTTY);
++        if (fd < 0 || ioctl(fd, TIOCSCTTY, 0) < 0 ||
++            tcsetpgrp(fd, getpgrp()) < 0) {
++            child_fail("controlling ttyS0");
++        }
++        for (int target = STDIN_FILENO; target <= STDERR_FILENO; target++) {
++            if (dup2(fd, target) < 0) {
++                child_fail("dup2 ttyS0");
++            }
++        }
++        if (fd > STDERR_FILENO && close(fd) < 0) {
++            child_fail("close ttyS0");
++        }
++        if (setenv("PATH", "/bin:/sbin", 1) < 0 ||
++            setenv("PS1", "minivmm# ", 1) < 0 ||
++            setenv("TERM", "vt100", 1) < 0) {
++            child_fail("environment");
++        }
++        execl("/bin/sh", "sh", "-i", (char *)NULL);
++        child_fail("exec /bin/sh");
++    }
++
++    /* PID 1 remains alive and also reaps orphaned descendants. */
++    for (;;) {
++        int status;
++        const pid_t pid = waitpid(-1, &status, 0);
++        if (pid < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            fail_errno("waitpid");
++        }
++        if (pid == child) {
++            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
++                message("shell terminated");
++            }
++            return;
++        }
+     }
+ }
+ 
+@@ -75,6 +168,9 @@
+     }
+ 
+     message("ready");
++    if (shell_requested()) {
++        run_shell();
++    }
+     sync();
+     message("reboot");
+ 
+--- a/src/util/event_loop.c
++++ b/src/util/event_loop.c
+@@ -9,13 +9,15 @@
+ 
+ #define EVENT_BATCH_SIZE 16
+ 
+-static bool valid_events(uint32_t events) {
++static bool valid_events(uint32_t events)
++{
+     const uint32_t allowed = EPOLLIN | EPOLLOUT | EPOLLPRI | EPOLLRDHUP;
+ 
+     return events != 0 && (events & ~allowed) == 0;
+ }
+ 
+-static struct event_loop_source *find_fd(struct event_loop *loop, int fd) {
++static struct event_loop_source *find_fd(struct event_loop *loop, int fd)
++{
+     for (unsigned i = 0; i < EVENT_LOOP_MAX_SOURCES; i++) {
+         if (loop->sources[i].fd == fd) {
+             return &loop->sources[i];
+@@ -25,17 +27,17 @@
+     return NULL;
+ }
+ 
+-static struct event_loop_source *find_token(struct event_loop *loop, uint64_t token) {
++static struct event_loop_source *find_token(struct event_loop *loop,
++                                            uint64_t token)
++{
+     for (unsigned i = 0; i < EVENT_LOOP_MAX_SOURCES; i++) {
+-        if (loop->sources[i].fd >= 0 &&
+-            loop->sources[i].token == token) {
++        if (loop->sources[i].fd >= 0 && loop->sources[i].token == token) {
+             return &loop->sources[i];
+         }
+     }
+ 
+     return NULL;
+ }
+-
+ 
+ int event_loop_init(struct event_loop *loop)
+ {
+@@ -72,8 +74,7 @@
+         goto fail;
+     }
+ 
+-    if (epoll_ctl(loop->epoll_fd, EPOLL_CTL_ADD,
+-                  loop->wake_fd, &event) < 0) {
++    if (epoll_ctl(loop->epoll_fd, EPOLL_CTL_ADD, loop->wake_fd, &event) < 0) {
+         goto fail;
+     }
+ 
+@@ -87,14 +88,13 @@
+ }
+ 
+ int event_loop_add(struct event_loop *loop, int fd, uint32_t events,
+-                    event_loop_fn fn, void *opaque)
++                   event_loop_fn fn, void *opaque)
+ {
+     struct event_loop_source *source;
+     struct epoll_event event;
+ 
+-    if (loop == NULL || loop->epoll_fd < 0 || fd < 0 ||
+-        fd == loop->epoll_fd || fd == loop->wake_fd ||
+-        fn == NULL || !valid_events(events)) {
++    if (loop == NULL || loop->epoll_fd < 0 || fd < 0 || fd == loop->epoll_fd ||
++        fd == loop->wake_fd || fn == NULL || !valid_events(events)) {
+         errno = EINVAL;
+         return -1;
+     }
+@@ -139,8 +139,7 @@
+     struct event_loop_source *source;
+     struct epoll_event event;
+ 
+-    if (loop == NULL || loop->epoll_fd < 0 || fd < 0 ||
+-        !valid_events(events)) {
++    if (loop == NULL || loop->epoll_fd < 0 || fd < 0 || !valid_events(events)) {
+         errno = EINVAL;
+         return -1;
+     }
+@@ -189,10 +188,8 @@
+ {
+     struct epoll_event events[EVENT_BATCH_SIZE];
+ 
+-    while (!atomic_load_explicit(&loop->stop_requested,
+-                                  memory_order_acquire)) {
+-        const int n =
+-            epoll_wait(loop->epoll_fd, events, EVENT_BATCH_SIZE, -1);
++    while (!atomic_load_explicit(&loop->stop_requested, memory_order_acquire)) {
++        const int n = epoll_wait(loop->epoll_fd, events, EVENT_BATCH_SIZE, -1);
+ 
+         if (n < 0) {
+             if (errno == EINTR) {
+@@ -227,8 +224,8 @@
+ 
+             const struct event_loop_source current = *source;
+ 
+-            if (current.fn(loop, current.fd, events[i].events,
+-                           current.opaque) < 0) {
++            if (current.fn(loop, current.fd, events[i].events, current.opaque) <
++                0) {
+                 return -1;
+             }
+         }
+@@ -267,8 +264,7 @@
+         return -1;
+     }
+ 
+-    atomic_store_explicit(&loop->stop_requested, true,
+-                          memory_order_release);
++    atomic_store_explicit(&loop->stop_requested, true, memory_order_release);
+ 
+     for (;;) {
+         const ssize_t n = write(loop->wake_fd, &one, sizeof(one));
+@@ -310,4 +306,3 @@
+         loop->wake_fd = -1;
+     }
+ }
+-
+--- a/src/util/event_loop.h
++++ b/src/util/event_loop.h
+@@ -13,8 +13,8 @@
+  * Return 0 to continue, or -1 with errno set to fail event_loop_run().
+  * The callback may add, modify or remove sources, including itself.
+  */
+-typedef int (*event_loop_fn)(struct event_loop *loop, int fd,
+-                             uint32_t events, void *opaque);
++typedef int (*event_loop_fn)(struct event_loop *loop, int fd, uint32_t events,
++                             void *opaque);
+ 
+ struct event_loop_source {
+     int fd; /* borrowed; -1 means unused */
+@@ -52,7 +52,7 @@
+  * No concurrent table operations or nested/concurrent run() calls.
+  */
+ int event_loop_add(struct event_loop *loop, int fd, uint32_t events,
+-                    event_loop_fn fn, void *opaque);
++                   event_loop_fn fn, void *opaque);
+ 
+ int event_loop_mod(struct event_loop *loop, int fd, uint32_t events);
+ 
+--- /dev/null
++++ b/tests/integration/test_console.py
+@@ -0,0 +1,159 @@
++"""Exercise a real guest shell through a PTY without pexpect."""
++
++import errno
++import fcntl
++import os
++import pty
++import select
++import signal
++import subprocess
++import termios
++import time
++
++import pytest
++
++pytestmark = [pytest.mark.kvm, pytest.mark.guest]
++
++
++class Console:
++    def __init__(self, process, master, stderr_path):
++        self.process = process
++        self.master = master
++        self.stderr_path = stderr_path
++        self.output = bytearray()
++        self.cursor = 0
++
++    def diagnostics(self):
++        serial = self.output[-32768:].decode(errors="replace")
++        stderr = self.stderr_path.read_text(errors="replace")[-32768:]
++        return f"serial:\n{serial}\nstderr:\n{stderr}"
++
++    def read_ready(self):
++        try:
++            data = os.read(self.master, 65536)
++        except BlockingIOError:
++            return
++        except OSError as error:
++            if error.errno == errno.EIO:
++                return
++            raise
++        self.output.extend(data)
++
++    def expect(self, needle, timeout=10):
++        deadline = time.monotonic() + timeout
++        while True:
++            found = self.output.find(needle, self.cursor)
++            if found >= 0:
++                self.cursor = found + len(needle)
++                return
++            left = deadline - time.monotonic()
++            assert left > 0, f"Timeout waiting for {needle!r}\n{self.diagnostics()}"
++            ready, _, _ = select.select([self.master], [], [], min(left, 0.1))
++            if ready:
++                self.read_ready()
++            if self.process.poll() is not None and not ready:
++                pytest.fail(f"VMM exited before {needle!r}\n{self.diagnostics()}")
++
++    def send(self, data, timeout=20):
++        deadline = time.monotonic() + timeout
++        offset = 0
++        while offset < len(data):
++            left = deadline - time.monotonic()
++            assert left > 0, f"Timeout sending input\n{self.diagnostics()}"
++            readable, writable, _ = select.select([self.master], [self.master], [], min(left, 0.1))
++            if readable:
++                self.read_ready()
++            if writable:
++                try:
++                    offset += os.write(self.master, data[offset : offset + 1024])
++                except BlockingIOError:
++                    continue
++
++    def wait_exit(self, timeout=10):
++        deadline = time.monotonic() + timeout
++        while self.process.poll() is None:
++            left = deadline - time.monotonic()
++            assert left > 0, f"VMM did not exit\n{self.diagnostics()}"
++            ready, _, _ = select.select([self.master], [], [], min(left, 0.1))
++            if ready:
++                self.read_ready()
++        return self.process.wait()
++
++
++@pytest.mark.parametrize("finish", ["guest_exit", "sigint", "sigterm", "escape"])
++def test_interactive_console(minivmm, guest_kernel, guest_initramfs, tmp_path, finish):
++    master, slave = pty.openpty()
++    original_termios = termios.tcgetattr(slave)
++    original_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
++    os.set_blocking(master, False)
++    process = None
++    console = None
++    stderr_path = tmp_path / "vmm.stderr"
++
++    try:
++        with stderr_path.open("wb") as stderr:
++            process = subprocess.Popen(
++                [
++                    str(minivmm),
++                    "--kernel",
++                    str(guest_kernel),
++                    "--initrd",
++                    str(guest_initramfs),
++                    "--interactive",
++                ],
++                stdin=slave,
++                stdout=slave,
++                stderr=stderr,
++                start_new_session=True,
++            )
++            console = Console(process, master, stderr_path)
++            console.expect(b"minivmm# ", timeout=30)
++            assert process.poll() is None, console.diagnostics()
++            assert fcntl.fcntl(slave, fcntl.F_GETFL) == original_flags
++
++            # The expected marker does not occur literally in the echoed command.
++            console.send(b"printf 'PTY_%s\\n' OK\n")
++            console.expect(b"PTY_OK")
++            console.expect(b"minivmm# ")
++
++            if finish == "guest_exit":
++                # Foreground group exists before its child prints READY.
++                console.send(b"sh -c 'printf \"FG_%s\\n\" READY; exec sleep 30'\n")
++                console.expect(b"FG_READY")
++                console.send(b"\x03")  # Ctrl-C belongs to the guest foreground job.
++                console.expect(b"minivmm# ", timeout=5)
++                assert process.poll() is None, console.diagnostics()
++
++                # Exceeds the 4096-byte host queue and exercises RX backpressure.
++                commands = b"".join(f"printf 'PASTE_%03d\\n' {i}\n".encode() for i in range(200))
++                assert len(commands) > 4096
++                console.send(commands)
++                console.expect(b"PASTE_199", timeout=20)
++                for i in range(200):
++                    assert f"PASTE_{i:03d}".encode() in console.output
++                console.expect(b"minivmm# ")
++                console.send(b"exit\n")
++            elif finish in ("sigint", "sigterm"):
++                process.send_signal(signal.SIGINT if finish == "sigint" else signal.SIGTERM)
++            else:
++                console.send(b"\x1d")  # Ctrl-] exits the host VMM.
++
++            assert console.wait_exit() == 0, console.diagnostics()
++            assert termios.tcgetattr(slave) == original_termios
++            assert fcntl.fcntl(slave, fcntl.F_GETFL) == original_flags
++            assert "minivmm-init: FAIL" not in console.output.decode(errors="replace")
++            if finish == "guest_exit":
++                assert "guest requested reboot via i8042" in stderr_path.read_text()
++    finally:
++        if console is not None:
++            (tmp_path / "serial.log").write_bytes(console.output)
++        # Closing the PTY master also releases a writer blocked on console output.
++        os.close(master)
++        if process is not None and process.poll() is None:
++            process.terminate()
++            try:
++                process.wait(timeout=3)
++            except subprocess.TimeoutExpired:
++                process.kill()
++                process.wait(timeout=3)
++        os.close(slave)
